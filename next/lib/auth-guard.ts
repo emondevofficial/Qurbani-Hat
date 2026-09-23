@@ -73,7 +73,8 @@ export async function guardDatabaseBackedAuthRequest(
   console.error(
     `[QurbaniHat] Auth endpoint ${pathname} blocked: MongoDB is unavailable ` +
       `(kind=${status.kind}, configured=${status.configured}, ` +
-      `target=${status.target}, database=${status.database}). ${status.detail}`,
+      `target=${status.target}, database=${status.database}). ${status.detail}` +
+      (status.raw ? ` Driver said: ${status.raw}` : ""),
   );
 
   return Response.json(

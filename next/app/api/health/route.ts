@@ -57,8 +57,9 @@ export async function GET() {
         probe = result;
         console.warn(
           `[QurbaniHat] MongoDB probe for ${database.target}: ` +
-            `srv=${result.srv?.ok ?? "?"} tcp=${result.tcp?.ok ?? "?"} ` +
-            `tls=${result.tls?.ok ?? "?"} ping=${result.ping?.ok ?? "?"} — ${result.verdict}`,
+            `srv=${result.srv?.ok ?? "?"} dns=${result.dns?.ok ?? "?"} ` +
+            `tcp=${result.tcp?.ok ?? "?"} tls=${result.tls?.ok ?? "?"} ` +
+            `ping=${result.ping?.ok ?? "?"} — ${result.verdict}`,
         );
       } catch (probeError) {
         console.error("[QurbaniHat] MongoDB connectivity probe crashed:", probeError);
@@ -78,6 +79,9 @@ export async function GET() {
         target: database.target,
         db: database.database,
         detail: database.detail,
+        // Redacted driver text behind `detail` — the raw evidence (a timeout, a
+        // DNS failure and an auth rejection all used to look identical).
+        raw: database.raw,
         // Staged network diagnosis — present only when reachable is false.
         probe,
       },

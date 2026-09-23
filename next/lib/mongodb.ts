@@ -133,6 +133,22 @@ export function redactSecrets(text: string): string {
 }
 
 /**
+ * Credential-free first "paragraph" of an error message, safe for logs and for
+ * diagnostics endpoints. Multi-line driver errors (a `MongoServerSelectionError`
+ * lists one `connect ...` line per host) are collapsed into one line so the
+ * whole causal chain survives.
+ */
+export function rawErrorText(error: unknown, max = 400): string {
+  const message =
+    error instanceof Error
+      ? `${error.name}: ${error.message}`
+      : typeof error === "object" && error !== null && "message" in error
+        ? String((error as { message: unknown }).message)
+        : String(error);
+  return redactSecrets(message).replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+/**
  * Short, credential-free summary of an arbitrary error, safe for server logs.
  */
 export function summarizeError(error: unknown): string {
@@ -153,6 +169,7 @@ export type DatabaseFailureKind =
   | "unreachable"
   | "dns"
   | "authentication"
+  | "tls-rejected"
   | "topology-closed"
   | "invalid-uri"
   | "timeout"
@@ -172,8 +189,35 @@ export type DatabaseFailureKind =
 export function describeMongoFailure(error: unknown): {
   kind: DatabaseFailureKind;
   detail: string;
+  /** Redacted driver text behind the classification — the raw evidence. */
+  raw: string;
 } {
-  const text = summarizeError(error);
+  const raw = rawErrorText(error);
+  return { ...classifyMongoFailure(raw), raw };
+}
+
+/** Maps redacted driver error text onto a failure kind plus an explanation. */
+function classifyMongoFailure(text: string): { kind: DatabaseFailureKind; detail: string } {
+  /**
+   * Atlas answers a TLS alert instead of dropping the socket when the source IP
+   * is not allowed, so this is the signature of an Atlas Network Access
+   * problem — NOT a Vercel egress problem. Verified signature:
+   *   MongoServerSelectionError: ...error:0A000438:SSL routines:
+   *   ssl3_read_bytes:tlsv1 alert internal error:... SSL alert number 80
+   * (SSL alert 80 = internal_error; see also the identical AWS ECS → Atlas
+   * reports, resolved by adding the client IP to the Atlas access list.)
+   */
+  if (
+    /tlsv1 alert internal error|SSL alert number 80|ERR_SSL_TLSV1_ALERT|ssl3_read_bytes|tlsv1 alert|handshake failure/i.test(
+      text,
+    )
+  ) {
+    return {
+      kind: "tls-rejected",
+      detail:
+        "Atlas refused the TLS handshake from this server (SSL alert 80 = internal_error). Atlas sends this alert when the connecting IP is not in its Network Access list, so add this deployment's egress IPs — or 0.0.0.0/0 for Vercel's dynamic IPs — to Atlas → Network Access and allow a minute for the change to propagate",
+    };
+  }
 
   if (/MongoTopologyClosedError|Topology is closed/i.test(text)) {
     return {
@@ -282,6 +326,13 @@ export interface DatabaseStatus {
   kind: DatabaseFailureKind;
   /** Credential-free explanation, safe for logs and for diagnostics endpoints. */
   detail: string;
+  /**
+   * Redacted driver text for a failed ping (credentials stripped by
+   * `rawErrorText`). This is the raw evidence behind `kind` — without it the
+   * classification hides whether the runtime saw a timeout, a DNS failure or an
+   * authentication rejection, which are three completely different fixes.
+   */
+  raw?: string;
 }
 
 /**
@@ -340,8 +391,8 @@ export async function getDatabaseStatus(force = false): Promise<DatabaseStatus> 
       await Promise.race([ping, timeout]);
       status = { ...base, reachable: true, kind: "ok", detail: "ok" };
     } catch (error) {
-      const { kind, detail } = describeMongoFailure(error);
-      status = { ...base, reachable: false, kind, detail };
+      const { kind, detail, raw } = describeMongoFailure(error);
+      status = { ...base, reachable: false, kind, detail, raw };
       (status as { _staleClient?: boolean })._staleClient = isStaleClientFailure(error);
     } finally {
       if (timer) clearTimeout(timer);

@@ -152,8 +152,18 @@ export function resolveServerBaseUrl(): string | undefined {
   const hosted = isHostedRuntime();
 
   const candidates: (string | undefined)[] = hosted
-    ? [vercelOrigin(), process.env.BETTER_AUTH_URL, process.env.NEXT_PUBLIC_APP_URL]
-    : [process.env.BETTER_AUTH_URL, process.env.NEXT_PUBLIC_APP_URL, vercelOrigin()];
+    ? [
+        vercelOrigin(),
+        process.env.BETTER_AUTH_URL,
+        process.env.NEXT_PUBLIC_BETTER_AUTH_URL,
+        process.env.NEXT_PUBLIC_APP_URL,
+      ]
+    : [
+        process.env.BETTER_AUTH_URL,
+        process.env.NEXT_PUBLIC_BETTER_AUTH_URL,
+        process.env.NEXT_PUBLIC_APP_URL,
+        vercelOrigin(),
+      ];
 
   for (const candidate of candidates) {
     const normalized = normalizeBrowsableUrl(candidate);
@@ -187,7 +197,11 @@ export function resolvePublicBaseUrl(): string {
  * is discarded when the page is not itself served from loopback.
  */
 export function resolveBrowserBaseUrl(): string | undefined {
-  const normalized = normalizeBrowsableUrl(process.env.NEXT_PUBLIC_APP_URL);
+  const publicBaseUrl =
+    process.env.NEXT_PUBLIC_BETTER_AUTH_URL?.trim() ||
+    process.env.NEXT_PUBLIC_APP_URL?.trim();
+
+  const normalized = normalizeBrowsableUrl(publicBaseUrl);
   if (!normalized) return undefined;
 
   if (typeof window !== "undefined" && isLoopbackUrl(normalized)) {
@@ -229,6 +243,14 @@ export function buildTrustedOrigins(): string[] {
     } catch {
       /* resolved is already validated, ignore */
     }
+  }
+
+  for (const candidate of [
+    process.env.NEXT_PUBLIC_BETTER_AUTH_URL,
+    process.env.NEXT_PUBLIC_APP_URL,
+  ]) {
+    const normalized = normalizeBrowsableUrl(candidate);
+    if (normalized) origins.add(normalized);
   }
 
   const production = toHttpsOrigin(process.env.VERCEL_PROJECT_PRODUCTION_URL);

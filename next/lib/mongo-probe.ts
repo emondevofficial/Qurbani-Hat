@@ -34,12 +34,18 @@ export interface ProbeStage {
   endpoint?: string;
   /** Resolved SRV targets (public DNS data — safe to show, capped at 3). */
   srvTargets?: string[];
+  /** A/AAAA records this runtime resolved for the dialled host (public data). */
+  addresses?: string[];
+  /** One line per dialled endpoint — shows whether *every* node failed. */
+  attempts?: string[];
   skipped?: boolean;
 }
 
 export interface ConnectivityProbe {
   ran: boolean;
   srv?: ProbeStage;
+  /** A/AAAA records for the shard endpoint that stage 2 dials. */
+  dns?: ProbeStage;
   tcp?: ProbeStage;
   tls?: ProbeStage;
   ping?: ProbeStage;
@@ -148,11 +154,56 @@ function tryTcp(host: string, port: number): Promise<{ ok: boolean; detail: stri
   });
 }
 
+/**
+ * A/AAAA lookup for the host the TCP stage will dial.
+ *
+ * A runtime whose resolver cannot see the Atlas shard names fails here, while a
+ * runtime whose resolver is fine but whose egress IP is not allowed in Atlas
+ * fails in stage 2 instead. Distinguishing the two matters: one is a DNS
+ * problem inside the function runtime, the other is an Atlas Network Access
+ * problem — and the previous ENOTFOUND report conflated them because it looked
+ * up the SRV *parent* (`cluster0.x.mongodb.net`), which has no A record by
+ * design and therefore fails even against a perfectly healthy Atlas cluster.
+ */
+async function tryResolve(host: string): Promise<ProbeStage> {
+  const read = async (kind: "resolve4" | "resolve6"): Promise<string[]> => {
+    try {
+      return await withTimeout(`${kind} lookup`, STAGE_TIMEOUT_MS, () => dnsPromises[kind](host));
+    } catch {
+      return [];
+    }
+  };
+
+  const [ipv4, ipv6] = await Promise.all([read("resolve4"), read("resolve6")]);
+  const addresses = [...ipv4, ...ipv6];
+
+  return {
+    ok: addresses.length > 0,
+    endpoint: host,
+    addresses,
+    detail:
+      addresses.length > 0
+        ? `${host} resolves to ${ipv4.length} IPv4 / ${ipv6.length} IPv6 record(s)` +
+          ` (A: ${ipv4.join(", ") || "none"}; AAAA: ${ipv6.join(", ") || "none"})`
+        : `${host} has no A/AAAA record from this runtime — the function's resolver cannot see Atlas`,
+  };
+}
+
 /** TLS handshake on a fresh socket to `endpoint`. Resolves, never throws. */
-function tryTls(host: string, port: number): Promise<{ ok: boolean; detail: string; ms: number }> {
+function tryTls(
+  host: string,
+  port: number,
+  override?: { maxVersion?: "TLSv1.2" | "TLSv1.3" },
+): Promise<{ ok: boolean; detail: string; ms: number }> {
   const started = Date.now();
   return new Promise((resolve) => {
-    const socket = tls.connect({ host, port, servername: host, rejectUnauthorized: true });
+    const socket = tls.connect({
+      host,
+      port,
+      servername: host,
+      rejectUnauthorized: true,
+      ...(override ?? {}),
+    });
     const finish = (ok: boolean, detail: string) => {
       socket.destroy();
       resolve({ ok, detail, ms: Date.now() - started });
@@ -204,6 +255,74 @@ async function tryAnonymousPing(
 }
 
 /**
+ * Turns the per-endpoint TCP attempts into an actionable verdict.
+ *
+ * The failure classes need different fixes, so they must not be collapsed into
+ * "the firewall blocked us":
+ *   - DNS failure     -> the function's resolver cannot see the shard names.
+ *   - connect timeout -> packets are dropped: Atlas Network Access does not
+ *                        allow this runtime's egress IP (Atlas drops silently,
+ *                        which is exactly why a blocked IP looks like a hang).
+ *   - refused/reset   -> something answered, but no MongoDB is listening there.
+ */
+function classifyTcpFailure(attempts: string[], dns?: ProbeStage): string {
+  const joined = attempts.join(" | ");
+
+  if (dns && !dns.ok) {
+    return (
+      `The Vercel runtime cannot resolve the Atlas shard hostname (${dns.detail}). ` +
+      "This is a DNS failure inside the function runtime, not an Atlas allowlist block — " +
+      "a blocked IP times out instead of failing DNS."
+    );
+  }
+
+  if (/ENOTFOUND|EAI_AGAIN|ESERVFAIL|querySrv/i.test(joined)) {
+    return (
+      `The Vercel runtime cannot resolve the Atlas shard hostname(s) (${joined}). ` +
+      "This is a DNS failure inside the function runtime, not an Atlas allowlist block — " +
+      "a blocked IP times out instead of failing DNS."
+    );
+  }
+
+  if (/timed out|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|ECONNREFUSED|ECONNRESET/i.test(joined)) {
+    return (
+      `The Vercel runtime cannot open a TCP socket to any Atlas shard endpoint (${joined}). ` +
+      "Atlas silently drops traffic from IP addresses that are not in Network Access, so confirm " +
+      "Atlas → Network Access contains 0.0.0.0/0 (or this deployment's egress IPs) for THIS " +
+      "project's cluster, that the entry is not temporary/expired, and that the cluster is not paused."
+    );
+  }
+
+  return `No Atlas shard endpoint accepted a TCP connection (${joined}).`;
+}
+
+/**
+ * Explains a failed TLS stage.
+ *
+ * DNS, TCP and SNI all succeed in this stage's predecessor, so the handshake is
+ * rejected by Atlas itself. MongoDB Atlas answers a *TLS alert* (not a dropped
+ * packet) when the connecting IP is missing from its Network Access list — the
+ * same `SSL alert number 80` signature that AWS ECS → Atlas users see — so the
+ * fix belongs in Atlas, not in the Vercel configuration.
+ */
+function classifyTlsFailure(detail: string, endpoint: string): string {
+  if (/alert internal error|SSL alert number 80|ERR_SSL_TLSV1_ALERT|handshake failure/i.test(detail)) {
+    return (
+      `Atlas accepted the TCP connection to ${endpoint} but refused the TLS handshake ` +
+      `(SSL alert 80 = internal_error). Atlas returns this alert when the connecting IP address is ` +
+      "not in its Network Access list, so add this deployment's egress IPs — or 0.0.0.0/0 for " +
+      "Vercel's dynamic IPs — to Atlas → Network Access, wait about a minute for the change to " +
+      "propagate, then reload this page."
+    );
+  }
+
+  return (
+    `TCP works but the TLS handshake with Atlas fails (${detail}). Verify the cluster is not paused ` +
+    "and that its Atlas → Network Access list allows this deployment's egress IPs."
+  );
+}
+
+/**
  * Runs the staged probe. Always resolves — a probe failure is data, not an
  * exception — and is safe to expose: no secrets are ever included.
  */
@@ -215,6 +334,7 @@ export async function runConnectivityProbe(): Promise<ConnectivityProbe> {
 
   const probe: ConnectivityProbe = { ran: true, verdict: "" };
   let endpoint = `${target.hostname}:${target.port}`;
+  const srvTargets: string[] = [];
 
   // Stage 1 — SRV (only meaningful for mongodb+srv URIs).
   if (target.isSrv) {
@@ -230,6 +350,7 @@ export async function runConnectivityProbe(): Promise<ConnectivityProbe> {
             : "SRV lookup returned no records",
         srvTargets: records.slice(0, 3).map((record) => `${record.name}:${record.port}`),
       };
+      for (const record of records.slice(0, 3)) srvTargets.push(`${record.name}:${record.port}`);
       const first = records[0];
       if (first) endpoint = `${first.name}:${first.port}`;
     } catch (error) {
@@ -241,33 +362,82 @@ export async function runConnectivityProbe(): Promise<ConnectivityProbe> {
     }
   } else {
     probe.srv = { ok: true, skipped: true, detail: "URI is a standard seed-list (no SRV lookup needed)" };
+    srvTargets.push(endpoint);
   }
 
-  // Stage 2 — raw TCP against the REAL shard endpoint, not the SRV parent name.
-  // `cluster0.x.mongodb.net` is SRV-only (no A record by design), so dialling it
-  // directly always fails with ENOTFOUND even when Atlas is perfectly healthy.
-  const { host: tcpHost, port: tcpPort } = splitEndpoint(endpoint, target.port);
-  const tcp = await tryTcp(tcpHost, tcpPort);
-  probe.tcp = { ok: tcp.ok, detail: tcp.detail, ms: tcp.ms, endpoint };
+  if (srvTargets.length === 0) srvTargets.push(endpoint);
+
+  // Stage 2a — A/AAAA records for the endpoint stage 2b dials. Separating the
+  // resolver from the socket proves whether a failure is DNS or networking.
+  const firstDialTarget = srvTargets[0];
+  probe.dns = await tryResolve(splitEndpoint(firstDialTarget, target.port).host);
+
+  // Stage 2b — raw TCP against the REAL shard endpoints, never the SRV parent
+  // name (`cluster0.x.mongodb.net` is SRV-only and has no A record by design, so
+  // dialling it always fails with ENOTFOUND even when Atlas is perfectly
+  // healthy). Every advertised shard is tried, so one dead node cannot produce a
+  // false "the whole cluster is blocked" verdict.
+  const attempts: string[] = [];
+  let tcp = { ok: false, detail: "no endpoint to dial", ms: 0 };
+  let tcpEndpoint = firstDialTarget;
+
+  for (const candidate of srvTargets) {
+    const { host, port } = splitEndpoint(candidate, target.port);
+    const result = await tryTcp(host, port);
+    attempts.push(`${candidate} -> ${result.detail} (${result.ms}ms)`);
+    tcpEndpoint = candidate;
+    tcp = result;
+    if (result.ok) break;
+  }
+
+  probe.tcp = { ok: tcp.ok, detail: tcp.detail, ms: tcp.ms, endpoint: tcpEndpoint, attempts };
   if (!tcp.ok) {
     probe.tls = { ok: false, skipped: true, detail: "skipped (TCP failed)" };
     probe.ping = { ok: false, skipped: true, detail: "skipped (TCP failed)" };
-    probe.verdict =
-      `The Vercel runtime cannot open even a raw TCP socket to Atlas (${endpoint}). ` +
-      "This is a firewall/allowlist effect: confirm Atlas → Network Access really contains 0.0.0.0/0 " +
-      "for THIS project's cluster (not another project), that the entry is not temporary/expired, " +
-      "and that the cluster is not paused.";
+    probe.verdict = classifyTcpFailure(attempts, probe.dns);
     return probe;
   }
 
-  // Stage 3 — TLS against the same shard endpoint.
-  const tlsResult = await tryTls(tcpHost, tcpPort);
-  probe.tls = { ok: tlsResult.ok, detail: tlsResult.detail, ms: tlsResult.ms, endpoint };
+  // Stage 3 — TLS against the same shard endpoint. If the default handshake is
+  // refused, retry pinned to TLS 1.2: a refusal that only affects TLS 1.3 is a
+  // protocol problem the app can work around, while a refusal on *both* means
+  // the peer is rejecting the connection itself (Atlas Network Access).
+  const { host: tlsHost, port: tlsPort } = splitEndpoint(tcpEndpoint, target.port);
+  const tlsResult = await tryTls(tlsHost, tlsPort);
+  const tlsAttempts = [`default (TLS 1.3 offered): ${tlsResult.detail}`];
+  let tlsOk = tlsResult.ok;
+
   if (!tlsResult.ok) {
+    const legacy = await tryTls(tlsHost, tlsPort, { maxVersion: "TLSv1.2" });
+    tlsAttempts.push(`maxVersion=TLSv1.2: ${legacy.detail}`);
+    tlsOk = legacy.ok;
+  }
+
+  probe.tls = {
+    ok: tlsOk,
+    detail: tlsResult.ok ? tlsResult.detail : tlsAttempts.join(" | "),
+    ms: tlsResult.ms,
+    endpoint: tcpEndpoint,
+    attempts: tlsAttempts,
+  };
+
+  if (!tlsOk) {
     probe.ping = { ok: false, skipped: true, detail: "skipped (TLS failed)" };
     probe.verdict =
-      "TCP works but the TLS handshake with Atlas fails — outbound TLS from the Vercel runtime is " +
-      "being intercepted or dropped. Re-check Atlas cluster status, then redeploy and retest.";
+      classifyTlsFailure(tlsResult.detail, tcpEndpoint) +
+      " Both the default handshake and a TLS 1.2-only handshake were refused, so this is not a " +
+      "protocol-version problem.";
+    return probe;
+  }
+
+  if (!tlsResult.ok) {
+    // TLS 1.2 completes but the runtime's preferred handshake does not: pin the
+    // runtime to TLS 1.2 and redeploy.
+    probe.ping = { ok: false, skipped: true, detail: "skipped (TLS 1.2 fallback only)" };
+    probe.verdict =
+      `The TLS handshake to ${tcpEndpoint} is only accepted with TLS 1.2 — the runtime's TLS 1.3 ` +
+      "handshake is refused by Atlas. Set NODE_OPTIONS=--tls-max-v1.2 for this deployment (Vercel → " +
+      "Settings → Environment Variables) and redeploy.";
     return probe;
   }
 

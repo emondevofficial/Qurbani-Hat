@@ -6,3 +6,8 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Local diagnostic evidence (deploy logs, health snapshots, cookies) — the E2E
+# verifier script itself stays tracked.
+.diagnostics/*
+!.diagnostics/e2e-auth-check.ps1
