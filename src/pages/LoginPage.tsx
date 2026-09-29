@@ -45,6 +45,7 @@ export function LoginPage() {
     const errorDesc = searchParams.get('error_description');
     if (errorParam) {
       setError(errorDesc ? `${errorParam}: ${decodeURIComponent(errorDesc)}` : errorParam);
+      setShowOAuthHelp(true);
     }
   }, [searchParams]);
 

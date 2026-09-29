@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useAuth } from '../lib/auth-context';
 import { useRouter, Link } from '../lib/router-context';
 import { getGoogleRedirectUri } from '../lib/oauth';
@@ -33,6 +33,15 @@ export function RegisterPage() {
   const [isGoogleSubmitting, setIsGoogleSubmitting] = useState(false);
   const [showOAuthHelp, setShowOAuthHelp] = useState(false);
   const [copiedUri, setCopiedUri] = useState<string | null>(null);
+
+  useEffect(() => {
+    const errorParam = searchParams.get('error');
+    const errorDesc = searchParams.get('error_description');
+    if (errorParam) {
+      setError(errorDesc ? `${errorParam}: ${decodeURIComponent(errorDesc)}` : errorParam);
+      setShowOAuthHelp(true);
+    }
+  }, [searchParams]);
 
   // Derived from the same shared helper the server uses, so the value shown
   // here can never drift from the redirect_uri actually sent to Google.
